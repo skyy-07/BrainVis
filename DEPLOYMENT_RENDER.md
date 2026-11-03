@@ -1,194 +1,127 @@
-# Deploying BrainVis on Render (Lightweight Production Guide)
+# BrainVis Deployment Guide: Authentic Architecture & Hybrid Worker Setup
 
-This guide provides step-by-step instructions for deploying **BrainVis** on [Render](https://render.com) as a lightweight, production-ready REST API and interactive web dashboard for **EEG wave analysis** and **visual stimulus image reconstruction**.
-
----
-
-## 🚀 Key Lightweight Architecture Highlights
-
-To satisfy low-memory limits (Render 512MB RAM free/starter tiers) and avoid multi-gigabyte build downloads:
-
-1. **Lightweight CPU PyTorch**:
-   Uses CPU-only PyTorch wheels (~200MB) instead of the default ~2.5GB CUDA packages.
-2. **Zero Heavy Checkpoint Footprint**:
-   The raw BrainVis pipeline relies on a 4.2GB Stable Diffusion v1.5 checkpoint (`v1-5-pruned-emaonly.ckpt`) and ~1.5GB CLIP weights, which cause instant Out-Of-Memory (OOM) crashes on standard cloud web services.
-   - **Default Mode**: Built-in, ultra-fast neural visual synthesizer and cortical saliency generator running entirely in RAM (< 50MB) on CPU in milliseconds.
-   - **Cloud Diffusion Mode (Optional)**: If you set the `HF_API_TOKEN` environment variable on Render, BrainVis offloads image generation to Hugging Face's serverless Stable Diffusion v1.5 API using the decoded EEG prompt—providing full photorealistic 512×512 diffusion generations with **0 MB local model weight download**.
-3. **Interactive Web Dashboard**:
-   Serves an interactive web interface at `/` with preset EEG waveforms (Panda, Mountain Bike, Pizza, Cat, Daisy, etc.), interactive trace charts, frequency band breakdowns, and instant image generation.
-4. **Full REST API**:
-   Automated interactive OpenAPI / Swagger documentation at `/docs`.
+This guide documents the authentic **BrainVis (ICASSP 2025)** system architecture, the strict input tensor contract, and how to operate the system either as a **Native CUDA Worker** (with real weights and cascaded diffusion) or as a **Cloud API Gateway** on Render.
 
 ---
 
-## 📋 Deployment Methods on Render
+## 🧠 Authentic BrainVis System Architecture
 
-### Method 1: 1-Click Blueprint Deployment (Recommended)
+In the BrainVis paper (*"BrainVis: Exploring the Bridge between Brain and Visual Signals via Image Reconstruction"*), the system pipeline consists of three core stages:
 
-1. **Push to GitHub**:
-   Fork or push this repository to your GitHub account:
+```
+Raw EEG Signal (128 Channels, 440 Time Samples @ 250 Hz)
+                         │
+                         ▼
+        ┌──────────────────────────────────┐
+        │   BrainVis TimeFreqEncoder       │
+        │   • TimeEncoder (Transformer,    │
+        │     1024-d, 8 layers, 16 heads)  │
+        │   • FreqEncoder (FFT + LSTM,     │
+        │     128-d latent features)       │
+        │   • 40-Class Stimulus Logits     │
+        └─────────────────┬────────────────┘
+                         │ (1152-d multi-domain representation)
+                         ▼
+        ┌──────────────────────────────────┐
+        │        BrainVis AlignNet         │
+        │   • Multi-layer Tanh Residuals   │
+        │   • Maps EEG to CLIP space       │
+        │   • Output: [1, 77, 768] Latent  │
+        └─────────────────┬────────────────┘
+                         │ (77×768 CLIP text-embedding conditioning)
+                         ▼
+        ┌──────────────────────────────────┐
+        │       Cascaded Diffusion         │
+        │   Stage 1: PLMS Latent Diffusion │
+        │            (dc_ldm conditioned   │
+        │             on EEG-CLIP latent)  │
+        │   Stage 2: SD 1.5 Img2Img        │
+        │            (prompt + coarse img  │
+        │             refinement @ s=0.85) │
+        └─────────────────┬────────────────┘
+                         │
+                         ▼
+             Reconstructed Visual Stimulus
+```
+
+---
+
+## 📐 Strict Input Tensor Contract
+
+BrainVis **strictly enforces** the experimental EEG recording contract:
+- **Number of Channels**: Exactly `128` channels in the standard 10-20 montage.
+- **Time Duration**: Exactly `440` time samples (samples 20 to 460 from a 250 Hz recording, corresponding to 1.76 seconds of visual stimulus presentation).
+- **Accepted Shapes**: `(128, 440)` or `(440, 128)` or `(batch, 128, 440)`.
+- If an input tensor with any other channel count or duration is provided, the API strictly rejects it with an **HTTP 422 Unprocessable Entity**.
+
+---
+
+## 🔑 Obtaining Checkpoints
+
+The authors of BrainVis (`fu2025brainvis`) do **not** distribute model weights directly inside the Git repository.
+
+1. **BrainVis Alignment Weights (`clipfinetune_model.pkl`)**:
+   - Request from the paper authors via email: `hfu006@e.ntu.edu.sg`
+   - Place the received checkpoint at:
+     ```
+     exp/clipfinetune_model.pkl
+     ```
+   - When loaded, the service automatically detects the checkpoint and marks `checkpoint_loaded: true`.
+2. **Stable Diffusion 1.5 Weights (`v1-5-pruned-emaonly.ckpt`)**:
+   - Download the official Stable Diffusion v1.5 pruned checkpoint (4.27 GB):
+     ```bash
+     wget -O pretrained_model/v1-5-pruned-emaonly.ckpt https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.ckpt
+     ```
+
+---
+
+## 🖥️ Running the Native CUDA Worker (for MnemoSplat / GPU Inference)
+
+For genuine cascaded diffusion and EEG-to-image reconstruction, run the dedicated CUDA worker on an NVIDIA GPU machine (e.g. local RTX 3090/4090/A100, RunPod, or Modal):
+
+```bash
+# 1. Install dependencies
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install fastapi uvicorn omegaconf einops diffusers transformers pillow numpy scipy
+
+# 2. Start the native CUDA worker
+python native_worker.py --host 0.0.0.0 --port 8080
+```
+
+The worker exposes:
+- `POST /reconstruct`: Receives `(128, 440)` EEG tensor, runs `AlignNet` &rarr; `(77, 768)` CLIP latent &rarr; Stage 1 PLMSSampler &rarr; Stage 2 SD Img2Img &rarr; Returns true reconstructed image.
+- `GET /status`: Reports GPU VRAM, device, and checkpoint status.
+
+---
+
+## ☁️ Deploying on Render (Hybrid API Gateway)
+
+Render's standard/free tiers provide 512MB RAM and CPU only, which cannot host a 4.2GB diffusion model locally. Render serves as the **API Gateway**:
+
+1. **Push your repository to GitHub**:
    ```bash
    git add .
-   git commit -m "Add lightweight Render deployment setup"
+   git commit -m "Update authentic BrainVis gateway and CUDA worker"
    git push origin main
    ```
-2. **Open Render**:
-   - Go to [dashboard.render.com](https://dashboard.render.com).
-   - Click **New +** > **Blueprint**.
-   - Connect your GitHub repository.
-   - Render automatically detects `render.yaml` and sets up the web service.
-3. **Configure Environment Variables (Optional)**:
-   - `HF_API_TOKEN`: *(Optional)* Your Hugging Face user access token (free from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)) if you want photorealistic Stable Diffusion generations.
-4. Click **Apply**. Render will build and deploy your service.
-
----
-
-### Method 2: Manual Web Service Setup
-
-1. In Render Dashboard, click **New +** > **Web Service**.
-2. Connect your GitHub repository.
-3. Configure the settings:
-   - **Name**: `brainvis-api` (or any name)
-   - **Region**: Choose the closest region (e.g., Oregon, Frankfurt)
-   - **Runtime**: `Python`
-   - **Build Command**:
-     ```bash
-     pip install --no-cache-dir -r requirements.txt
+2. **Deploy on Render**:
+   - Connect your repo on [dashboard.render.com](https://dashboard.render.com).
+   - Use the included [`render.yaml`](render.yaml) blueprint.
+3. **Connect to your Native CUDA Worker (Hybrid Mode)**:
+   - In Render Web Service settings, set the environment variable:
      ```
-   - **Start Command**:
-     ```bash
-     uvicorn app:app --host 0.0.0.0 --port $PORT
+     CUDA_WORKER_URL=http://your-gpu-worker-ip:8080
      ```
-   - **Plan**: `Free` or `Starter`
-4. In **Advanced Settings**:
-   - **Health Check Path**: `/health`
-   - **Environment Variables**:
-     - `PYTHON_VERSION`: `3.11.9`
-     - `HF_API_TOKEN`: *(Optional)* `hf_xxxxxxxxxxxxxxxxxxxx`
-5. Click **Create Web Service**.
+   - When configured, Render validates the strict `(128, 440)` EEG input contract, runs BrainVis feature validation, delegates the cascaded diffusion to the GPU worker, and returns the authentic reconstruction to MnemoSplat or your frontend.
 
 ---
 
-### Method 3: Docker Deployment
+## 📡 API Endpoints
 
-If you prefer containerized deployment, Render also supports Docker:
-1. Choose **Docker** as the environment.
-2. Render will automatically build the included `Dockerfile`.
-
----
-
-## 📡 API Endpoints Reference
-
-| Method | Endpoint | Description |
+| Endpoint | Method | Description |
 | :--- | :--- | :--- |
-| `GET` | `/` | Interactive Web Dashboard (UI) |
-| `GET` | `/health` | Health check endpoint for uptime monitoring |
-| `GET` | `/docs` | Interactive Swagger UI API documentation |
-| `GET` | `/api/classes` | Returns all 40 ImageNet visual stimulus categories |
-| `GET` | `/api/sample-eeg` | Returns synthetic sample EEG waveform data |
-| `POST` | `/api/analyze` | Computes band powers, wave statistics, and predicted stimulus |
-| `POST` | `/api/reconstruct` | Reconstructs image from label/category/EEG data |
-| `POST` | `/api/pipeline` | Unified end-to-end: EEG waves &rarr; Analysis + Image Reconstruction |
-| `POST` | `/api/upload-eeg` | File upload endpoint (`.npy`, `.csv`, `.json`, `.pth`) |
-
----
-
-## 💻 Code Examples & Usage
-
-### 1. Unified End-to-End Pipeline (Preset or Custom Waves)
-
-```bash
-curl -X POST "https://your-service-name.onrender.com/api/pipeline" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "preset": "panda",
-    "top_k": 5,
-    "prefer_cloud_diffusion": false
-  }'
-```
-
-**Response Preview**:
-```json
-{
-  "analysis": {
-    "signal_shape": {"channels": 128, "time_samples": 440},
-    "statistics": {
-      "mean_amplitude_uv": -0.0412,
-      "peak_to_peak_uv": 58.31,
-      "rms_uv": 14.85,
-      "spectral_entropy": 0.8124
-    },
-    "spectral_analysis": {
-      "relative_powers_percent": {
-        "delta": 18.4,
-        "theta": 12.1,
-        "alpha": 38.6,
-        "beta": 24.2,
-        "gamma": 6.7
-      },
-      "indices": {
-        "alpha_theta_ratio": 3.19,
-        "cognitive_workload_index": 0.48,
-        "visual_attention_index": 0.61
-      }
-    },
-    "predicted_stimulus": {
-      "class_index": 8,
-      "wnid": "n02510455",
-      "label": "panda",
-      "category": "animal",
-      "confidence_percent": 94.2
-    }
-  },
-  "reconstruction": {
-    "reconstructed_image_base64": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
-    "saliency_map_base64": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
-    "engine": "built-in-neural-synth",
-    "resolution": "512x512"
-  }
-}
-```
-
----
-
-### 2. Python Client Example
-
-```python
-import requests
-import base64
-
-API_URL = "https://your-service-name.onrender.com"
-
-# 1. Check health
-health = requests.get(f"{API_URL}/health").json()
-print("Service status:", health["status"])
-
-# 2. Run pipeline with EEG wave
-payload = {
-    "preset": "mountain bike",
-    "top_k": 3
-}
-response = requests.post(f"{API_URL}/api/pipeline", json=payload)
-data = response.json()
-
-print("Decoded Visual Stimulus:", data["analysis"]["predicted_stimulus"]["label"])
-print("Alpha Power:", data["analysis"]["spectral_analysis"]["relative_powers_percent"]["alpha"], "%")
-
-# 3. Save the reconstructed image to disk
-img_b64 = data["reconstruction"]["reconstructed_image_base64"].split(",")[1]
-with open("reconstructed_stimulus.png", "wb") as f:
-    f.write(base64.b64decode(img_b64))
-
-print("Saved reconstructed image to reconstructed_stimulus.png")
-```
-
----
-
-### 3. Uploading Custom EEG Files
-
-You can upload `.npy`, `.csv`, `.json`, or `.pth` files directly:
-
-```bash
-curl -X POST "https://your-service-name.onrender.com/api/upload-eeg" \
-  -F "file=@sample_eeg.npy"
-```
+| `GET /api/model-status` | `GET` | Reports loaded checkpoint path, input contract, and GPU worker status |
+| `GET /health` | `GET` | Health check endpoint |
+| `POST /api/pipeline` | `POST` | Unified pipeline: validates contract, extracts features, and reconstructs |
+| `POST /api/analyze` | `POST` | Strict EEG forward pass through `TimeFreqEncoder` and `AlignNet` |
+| `POST /api/upload-eeg` | `POST` | Validates and processes uploaded `.npy`, `.csv`, `.json`, or `.pth` EEG files |

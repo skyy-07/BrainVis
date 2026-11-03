@@ -246,23 +246,24 @@ class FreqEncoder(nn.Module):
 
     def forward(self, x):
         batch_size = x.size(0)
+        device = next(self.parameters()).device
         x = x.permute(0, 2, 1)
-        x = x.cpu()
-        fourier_transform = np.fft.fft(x, axis=2)
+        x_cpu = x.detach().cpu().numpy()
+        fourier_transform = np.fft.fft(x_cpu, axis=2)
         half_spectrum = fourier_transform[:, :, 1:440 // 2 + 1]
         amplitude_spectrum = np.abs(half_spectrum)
 
-        amplitude_spectrum = torch.tensor(amplitude_spectrum).float()
+        amplitude_spectrum = torch.tensor(amplitude_spectrum, dtype=torch.float32, device=device)
 
         x = amplitude_spectrum.permute(0, 2, 1)
-        x = x.to("cuda")
 
-        lstm_init = (torch.zeros(self.lstm_layers, batch_size, self.lstm_size),
-                     torch.zeros(self.lstm_layers, batch_size, self.lstm_size))
-        if x.is_cuda: lstm_init = (lstm_init[0].cuda(), lstm_init[0].cuda())
-        lstm_init = (Variable(lstm_init[0], volatile=x.volatile), Variable(lstm_init[1], volatile=x.volatile))
+        lstm_init = (
+            torch.zeros(self.lstm_layers, batch_size, self.lstm_size, device=device),
+            torch.zeros(self.lstm_layers, batch_size, self.lstm_size, device=device)
+        )
 
-        x = self.lstm(x, lstm_init)[0][:, -1, :]
+        lstm_out, _ = self.lstm(x, lstm_init)
+        x = lstm_out[:, -1, :]
         reps = x
         # Forward output
         xa = F.relu(self.output(x))

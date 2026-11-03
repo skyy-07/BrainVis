@@ -1,23 +1,25 @@
 import io
+import os
 import json
+import requests
 import numpy as np
 import torch
-from typing import List, Optional, Union
+from typing import List, Optional
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from service.eeg_analyzer import EEGAnalyzer, BRAINVIS_CLASSES
+from service.brainvis_native import BrainVisNativePipeline, BRAINVIS_CLASSES, EXPECTED_CHANNELS, EXPECTED_TIME_SAMPLES
+from service.eeg_analyzer import EEGAnalyzer
 from service.image_reconstructor import ImageReconstructor
 
 app = FastAPI(
-    title="BrainVis EEG Analysis & Image Reconstruction API",
-    description="Lightweight production endpoint for EEG signal analysis and visual stimulus reconstruction based on the BrainVis framework (ICASSP 2025).",
-    version="1.0.0"
+    title="BrainVis EEG Analysis & Image Reconstruction Service",
+    description="Production API Gateway for BrainVis (ICASSP 2025). Enforces strict (128, 440) tensor contracts, runs authentic AlignNet architecture, and interfaces with the Native CUDA Worker for Cascaded Diffusion.",
+    version="2.0.0"
 )
 
-# Enable CORS for cross-origin frontend apps
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,48 +28,79 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize engines
+native_pipeline = BrainVisNativePipeline()
 analyzer = EEGAnalyzer()
 reconstructor = ImageReconstructor()
+
+# Remote CUDA worker URL (optional, e.g., for MnemoSplat / GPU offload)
+CUDA_WORKER_URL = os.environ.get("CUDA_WORKER_URL", "").rstrip("/")
 
 # Pydantic Schemas
 class EEGAnalyzeRequest(BaseModel):
     eeg_data: Optional[List[List[float]]] = Field(
         None,
-        description="2D array of EEG wave values [channels, time_points] (e.g. 128x440) or [time_points]."
+        description=f"Strict 2D array of EEG wave values: ({EXPECTED_CHANNELS}, {EXPECTED_TIME_SAMPLES}) or ({EXPECTED_TIME_SAMPLES}, {EXPECTED_CHANNELS})."
     )
     preset: Optional[str] = Field(
         None,
         description="Optional synthetic preset name: 'panda', 'mountain bike', 'pizza', 'cat', 'daisy', 'electric guitar'."
     )
-    top_k: int = Field(5, description="Number of top visual classes to predict (default 5).")
-
-class ReconstructRequest(BaseModel):
-    label: str = Field(..., description="Target visual stimulus label (e.g. 'panda', 'pizza', 'cat').")
-    category: str = Field("object", description="Category of stimulus (e.g. 'animal', 'vehicle', 'food').")
-    confidence: float = Field(0.95, description="Prediction confidence score between 0 and 1.")
-    prefer_cloud_diffusion: bool = Field(False, description="Whether to query cloud Stable Diffusion if HF_API_TOKEN is set.")
+    top_k: int = Field(5, description="Number of top visual classes to predict.")
 
 class PipelineRequest(BaseModel):
     eeg_data: Optional[List[List[float]]] = Field(
         None,
-        description="2D array of EEG wave values [channels, time_points] or 1D list."
+        description=f"Strict 2D array of EEG wave values: ({EXPECTED_CHANNELS}, {EXPECTED_TIME_SAMPLES}) or ({EXPECTED_TIME_SAMPLES}, {EXPECTED_CHANNELS})."
     )
     preset: Optional[str] = Field(
         None,
         description="Optional synthetic preset name ('panda', 'mountain bike', 'pizza', 'cat', 'daisy', 'electric guitar')."
     )
     top_k: int = Field(5, description="Number of top classes.")
-    prefer_cloud_diffusion: bool = Field(False, description="Whether to invoke cloud diffusion API if token available.")
+    prefer_cloud_diffusion: bool = Field(False, description="Whether to query cloud diffusion API if HF_API_TOKEN is set.")
 
 @app.get("/health", tags=["Health"])
 def health_check():
     """Health check endpoint for Render service uptime monitoring."""
     return {
         "status": "healthy",
-        "service": "BrainVis EEG & Image Reconstruction API",
-        "version": "1.0.0",
-        "device": "cpu",
-        "lightweight_mode": True
+        "service": "BrainVis EEG & Image Reconstruction API Gateway",
+        "version": "2.0.0",
+        "checkpoint_loaded": native_pipeline.is_checkpoint_loaded,
+        "cuda_worker_configured": bool(CUDA_WORKER_URL),
+        "input_contract": f"({EXPECTED_CHANNELS}, {EXPECTED_TIME_SAMPLES})"
+    }
+
+@app.get("/api/model-status", tags=["Model Status"])
+def get_model_status():
+    """Reports authentic BrainVis model parameters, checkpoint loading state, and worker routes."""
+    worker_status = None
+    if CUDA_WORKER_URL:
+        try:
+            worker_resp = requests.get(f"{CUDA_WORKER_URL}/status", timeout=3)
+            if worker_resp.status_code == 200:
+                worker_status = worker_resp.json()
+        except Exception as e:
+            worker_status = {"error": f"Failed to contact CUDA worker at {CUDA_WORKER_URL}: {e}"}
+
+    return {
+        "model_architecture": "AlignNet (TimeEncoder + FreqEncoder -> TimeFreqEncoder -> AlignNet)",
+        "input_contract": {
+            "channels": EXPECTED_CHANNELS,
+            "time_samples": EXPECTED_TIME_SAMPLES,
+            "sample_rate_hz": 250,
+            "recording_window": "samples 20 to 460 (1.76s visual stimulus response)"
+        },
+        "checkpoint": {
+            "is_loaded": native_pipeline.is_checkpoint_loaded,
+            "source": native_pipeline.checkpoint_source,
+            "weights_filename": "clipfinetune_model.pkl",
+            "instruction": "Request checkpoint from authors (hfu006@e.ntu.edu.sg) and mount in exp/clipfinetune_model.pkl"
+        },
+        "device": native_pipeline.device,
+        "cuda_worker_url": CUDA_WORKER_URL or None,
+        "cuda_worker_status": worker_status
     }
 
 @app.get("/api/classes", tags=["Classes"])
@@ -79,14 +112,13 @@ def get_supported_classes():
     }
 
 @app.get("/api/sample-eeg", tags=["EEG"])
-def get_sample_eeg(preset: str = Query("panda", description="Sample preset name")):
-    """Generates and returns synthetic sample EEG wave data."""
-    preset = preset.lower()
-    signals = EEGAnalyzer.generate_synthetic_eeg(preset=preset, channels=8, time_points=200)
+def get_sample_eeg(preset: str = Query("panda", description="Preset name")):
+    """Generates synthetic EEG wave data matching the exact BrainVis (128, 440) contract."""
+    signals = EEGAnalyzer.generate_synthetic_eeg(preset=preset, channels=EXPECTED_CHANNELS, time_points=EXPECTED_TIME_SAMPLES)
     return {
         "preset": preset,
-        "channels": signals.shape[0],
-        "time_samples": signals.shape[1],
+        "channels": EXPECTED_CHANNELS,
+        "time_samples": EXPECTED_TIME_SAMPLES,
         "sample_rate_hz": 250,
         "eeg_data": signals.tolist()
     }
@@ -94,79 +126,115 @@ def get_sample_eeg(preset: str = Query("panda", description="Sample preset name"
 @app.post("/api/analyze", tags=["EEG Analysis"])
 def analyze_eeg(req: EEGAnalyzeRequest):
     """
-    Analyze EEG wave data:
-    - Power spectral density across Delta, Theta, Alpha, Beta, Gamma bands
-    - Waveform statistics (mean, variance, RMS, peak-to-peak amplitude, entropy)
-    - Brain state indices (Alpha/Theta ratio, cognitive workload, visual attention)
-    - Neural stimulus prediction across BrainVis visual categories
+    Analyzes EEG waves using the authentic BrainVis model and spectral decomposition.
+    Strictly validates the (128, 440) tensor contract.
     """
     if req.eeg_data is not None and len(req.eeg_data) > 0:
         data = np.array(req.eeg_data, dtype=np.float32)
     elif req.preset:
-        data = EEGAnalyzer.generate_synthetic_eeg(preset=req.preset, channels=128, time_points=440)
+        data = EEGAnalyzer.generate_synthetic_eeg(preset=req.preset, channels=EXPECTED_CHANNELS, time_points=EXPECTED_TIME_SAMPLES)
     else:
-        # Default to panda preset
-        data = EEGAnalyzer.generate_synthetic_eeg(preset="panda", channels=128, time_points=440)
+        data = EEGAnalyzer.generate_synthetic_eeg(preset="panda", channels=EXPECTED_CHANNELS, time_points=EXPECTED_TIME_SAMPLES)
 
-    result = analyzer.analyze(data, top_k=req.top_k)
-    return result
+    # 1. Enforce strict input contract and run authentic BrainVis forward pass
+    try:
+        model_result = native_pipeline.forward(data, top_k=req.top_k)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
-@app.post("/api/reconstruct", tags=["Image Reconstruction"])
-def reconstruct_image(req: ReconstructRequest):
-    """
-    Reconstruct visual stimulus image from decoded stimulus label/category.
-    Returns base64 encoded reconstruction image and metadata.
-    """
-    res = reconstructor.reconstruct(
-        label=req.label,
-        category=req.category,
-        confidence=req.confidence,
-        prefer_cloud_diffusion=req.prefer_cloud_diffusion
-    )
-    return res
+    # 2. Extract spectral statistics (for signal quality verification)
+    eeg_2d = data if data.ndim == 2 else data[0]
+    if eeg_2d.shape[0] != EXPECTED_CHANNELS and eeg_2d.shape[1] == EXPECTED_CHANNELS:
+        eeg_2d = eeg_2d.T
+    stats = analyzer.compute_wave_statistics(eeg_2d)
+    spectral = analyzer.compute_band_powers(eeg_2d)
+
+    return {
+        "brainvis_model": model_result,
+        "waveform_statistics": stats,
+        "spectral_analysis": spectral
+    }
 
 @app.post("/api/pipeline", tags=["Pipeline"])
 def full_eeg_to_image_pipeline(req: PipelineRequest):
     """
-    Unified end-to-end endpoint:
-    Input: Multi-channel EEG waves.
-    Output: Comprehensive wave analysis + Decoded Visual Class + Reconstructed Image & Cortical Saliency Map.
+    Unified end-to-end pipeline:
+    1. Validates strict (128, 440) EEG input contract.
+    2. Runs authentic BrainVis AlignNet to produce (77, 768) CLIP latent embedding.
+    3. If CUDA_WORKER_URL is configured, delegates cascaded diffusion to the GPU worker.
+       Otherwise, provides perceptual stimulus reconstruction with clear metadata tagging.
     """
     if req.eeg_data is not None and len(req.eeg_data) > 0:
-        eeg_np = np.array(req.eeg_data, dtype=np.float32)
+        data = np.array(req.eeg_data, dtype=np.float32)
     elif req.preset:
-        eeg_np = EEGAnalyzer.generate_synthetic_eeg(preset=req.preset, channels=128, time_points=440)
+        data = EEGAnalyzer.generate_synthetic_eeg(preset=req.preset, channels=EXPECTED_CHANNELS, time_points=EXPECTED_TIME_SAMPLES)
     else:
-        eeg_np = EEGAnalyzer.generate_synthetic_eeg(preset="panda", channels=128, time_points=440)
+        data = EEGAnalyzer.generate_synthetic_eeg(preset="panda", channels=EXPECTED_CHANNELS, time_points=EXPECTED_TIME_SAMPLES)
 
-    # 1. Analyze EEG wave
-    analysis = analyzer.analyze(eeg_np, top_k=req.top_k)
-    top_pred = analysis["predicted_stimulus"] or {
+    try:
+        model_result = native_pipeline.forward(data, top_k=req.top_k)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Delegate to remote CUDA worker if available
+    if CUDA_WORKER_URL:
+        try:
+            worker_payload = {
+                "eeg_data": data.tolist(),
+                "ddim_steps": 50,
+                "strength": 0.85,
+                "guidance_scale": 7.5
+            }
+            worker_resp = requests.post(f"{CUDA_WORKER_URL}/reconstruct", json=worker_payload, timeout=60)
+            if worker_resp.status_code == 200:
+                worker_data = worker_resp.json()
+                return {
+                    "source": "native_cuda_worker",
+                    "cuda_worker_url": CUDA_WORKER_URL,
+                    "analysis": model_result,
+                    "reconstruction": worker_data.get("reconstruction")
+                }
+        except Exception as e:
+            print(f"[Gateway] CUDA worker request failed: {e}. Falling back to gateway response.")
+
+    # Gateway visual reconstruction
+    top_pred = model_result["predicted_stimulus"] or {
         "label": "visual object",
         "category": "object",
-        "confidence_percent": 85.0
+        "confidence_percent": 2.5
     }
 
-    # 2. Reconstruct image
+    eeg_2d = data if data.ndim == 2 else data[0]
+    if eeg_2d.shape[0] != EXPECTED_CHANNELS and eeg_2d.shape[1] == EXPECTED_CHANNELS:
+        eeg_2d = eeg_2d.T
+    spectral = analyzer.compute_band_powers(eeg_2d)
+
     recon_res = reconstructor.reconstruct(
         label=top_pred["label"],
         category=top_pred["category"],
-        confidence=top_pred.get("probability", 0.9),
-        eeg_data=eeg_np,
-        band_powers=analysis["spectral_analysis"],
+        confidence=top_pred.get("probability", 0.025),
+        eeg_data=eeg_2d,
+        band_powers=spectral,
         prefer_cloud_diffusion=req.prefer_cloud_diffusion
     )
 
+    # Clearly label reconstruction metadata
+    recon_res["is_authentic_cascaded_diffusion"] = False
+    recon_res["note"] = (
+        "Reconstruction was generated on the CPU gateway. To run the full authors' Cascaded Diffusion "
+        "(Stage 1 PLMS + Stage 2 SD 1.5), configure CUDA_WORKER_URL pointing to the Native CUDA Worker."
+    )
+
     return {
-        "analysis": analysis,
+        "source": "cpu_gateway",
+        "analysis": model_result,
+        "spectral_analysis": spectral,
         "reconstruction": recon_res
     }
 
 @app.post("/api/upload-eeg", tags=["EEG File Upload"])
 async def upload_eeg_file(file: UploadFile = File(...), top_k: int = 5):
-    """
-    Upload an EEG file (.npy, .csv, .json, or .pth) and run the full BrainVis pipeline.
-    """
+    """Uploads an EEG file (.npy, .csv, .json, .pth) and runs the pipeline with contract validation."""
     contents = await file.read()
     filename = file.filename.lower()
 
@@ -190,258 +258,180 @@ async def upload_eeg_file(file: UploadFile = File(...), top_k: int = 5):
             else:
                 data = np.array(loaded, dtype=np.float32)
         else:
-            raise HTTPException(status_code=400, detail="Unsupported file format. Please upload .npy, .csv, .json, or .pth")
+            raise HTTPException(status_code=400, detail="Unsupported format. Use .npy, .csv, .json, or .pth")
 
-        if data.ndim == 1:
-            data = data.reshape(1, -1)
-
-        analysis = analyzer.analyze(data, top_k=top_k)
-        top_pred = analysis["predicted_stimulus"]
-
-        recon = reconstructor.reconstruct(
-            label=top_pred["label"],
-            category=top_pred["category"],
-            confidence=top_pred.get("probability", 0.9),
-            eeg_data=data,
-            band_powers=analysis["spectral_analysis"]
-        )
-
-        return {
-            "filename": file.filename,
-            "shape": list(data.shape),
-            "analysis": analysis,
-            "reconstruction": recon
-        }
+        pipeline_req = PipelineRequest(eeg_data=data.tolist(), top_k=top_k)
+        return full_eeg_to_image_pipeline(pipeline_req)
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to process EEG file: {str(e)}")
 
 @app.get("/", response_class=HTMLResponse, tags=["Dashboard"])
 def web_dashboard():
-    """Serves the interactive web UI for testing EEG wave analysis and visual reconstruction."""
+    """Serves the interactive web dashboard with transparent status banners and contract indicators."""
     html_content = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BrainVis: EEG Wave Analysis & Image Reconstruction</title>
+    <title>BrainVis: Brain-Visual Decoding Gateway</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css">
     <style>
         body { background-color: #0d1117; color: #c9d1d9; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
         .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; }
-        .accent-blue { color: #58a6ff; }
-        .accent-green { color: #3fb950; }
-        .accent-purple { color: #bc8cff; }
-        .badge { background: #21262d; border: 1px solid #30363d; border-radius: 6px; padding: 2px 8px; font-size: 0.8rem; }
         .progress-bar { background: #21262d; border-radius: 4px; overflow: hidden; height: 8px; }
         .progress-fill { height: 100%; transition: width 0.4s ease; }
     </style>
 </head>
 <body class="p-4 md:p-8">
     <div class="max-w-6xl mx-auto">
-        <!-- Header -->
-        <header class="mb-8 border-b border-gray-800 pb-6 flex flex-col md:flex-row justify-between items-start md:items-center">
-            <div>
-                <h1 class="text-3xl font-extrabold text-white flex items-center space-x-3">
-                    <span class="text-indigo-400">🧠</span>
-                    <span>BrainVis Cloud Endpoint</span>
-                </h1>
-                <p class="text-gray-400 text-sm mt-1">
-                    Multi-modal Brain-Visual Signal Decoding &amp; Perceptual Image Reconstruction
-                </p>
+        <!-- Status Banner -->
+        <div id="statusBanner" class="card p-3 mb-6 flex flex-col md:flex-row justify-between items-start md:items-center text-xs border-yellow-600 bg-yellow-900 bg-opacity-20">
+            <div class="flex items-center space-x-2">
+                <span id="statusLed" class="text-yellow-400 font-bold">⚠️ Checking Checkpoint Status...</span>
+                <span id="statusDetails" class="text-gray-300"></span>
             </div>
-            <div class="mt-4 md:mt-0 flex space-x-2">
-                <a href="/docs" target="_blank" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-md transition shadow">
-                    API Docs (Swagger)
-                </a>
-                <a href="/health" target="_blank" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs font-semibold rounded-md transition">
-                    Health Check
-                </a>
+            <div class="mt-2 md:mt-0 font-mono text-gray-400">
+                Input Contract: <span class="text-white">128 Channels × 440 Time Samples</span>
+            </div>
+        </div>
+
+        <!-- Header -->
+        <header class="mb-6 border-b border-gray-800 pb-4 flex justify-between items-center">
+            <div>
+                <h1 class="text-2xl font-extrabold text-white flex items-center space-x-2">
+                    <span>🧠</span>
+                    <span>BrainVis Decoding Service</span>
+                </h1>
+                <p class="text-gray-400 text-xs mt-0.5">Authentic AlignNet (77×768 CLIP Latent) &amp; Cascaded Diffusion Gateway</p>
+            </div>
+            <div class="space-x-2">
+                <a href="/docs" target="_blank" class="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded transition">API Docs</a>
+                <a href="/api/model-status" target="_blank" class="px-2.5 py-1 bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs font-semibold rounded transition">Model Status</a>
             </div>
         </header>
 
-        <!-- Controls -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-            <div class="card p-5 md:col-span-1">
-                <h2 class="text-lg font-bold text-white mb-3 flex items-center space-x-2">
-                    <span>⚡ EEG Signal Source</span>
-                </h2>
-                <div class="space-y-4">
+        <!-- Controls & Waveform -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+            <div class="card p-4">
+                <h2 class="text-sm font-bold text-white mb-2">⚡ EEG Input</h2>
+                <div class="space-y-3">
                     <div>
-                        <label class="block text-xs font-semibold text-gray-400 mb-1">Preset Neural Waveform</label>
-                        <select id="presetSelect" class="w-full bg-gray-900 border border-gray-700 rounded-md p-2 text-sm text-gray-200 focus:outline-none focus:border-blue-500">
-                            <option value="panda">Panda (Alpha + Beta sync)</option>
+                        <label class="block text-xs text-gray-400 mb-1">Preset Neural Signal (128x440)</label>
+                        <select id="presetSelect" class="w-full bg-gray-900 border border-gray-700 rounded p-1.5 text-xs text-gray-200">
+                            <option value="panda">Panda (Alpha + Beta)</option>
                             <option value="mountain bike">Mountain Bike (Visual attention)</option>
-                            <option value="pizza">Pizza (Food stimulus)</option>
+                            <option value="pizza">Pizza (Food category)</option>
                             <option value="cat">Cat (Animal category)</option>
-                            <option value="daisy">Daisy (Floral stimulus)</option>
+                            <option value="daisy">Daisy (Plant category)</option>
                             <option value="electric guitar">Electric Guitar (Instrument)</option>
                         </select>
                     </div>
-
                     <div>
-                        <label class="block text-xs font-semibold text-gray-400 mb-1">Or Upload EEG Data (.npy, .csv, .json)</label>
-                        <input type="file" id="eegFileInput" class="w-full text-xs text-gray-400 bg-gray-900 border border-gray-700 rounded-md p-1.5">
+                        <label class="block text-xs text-gray-400 mb-1">Upload EEG (.npy, .csv, .json)</label>
+                        <input type="file" id="eegFileInput" class="w-full text-xs text-gray-400 bg-gray-900 border border-gray-700 rounded p-1">
                     </div>
-
-                    <button id="runBtn" onclick="runAnalysis()" class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-md transition flex justify-center items-center space-x-2">
-                        <span id="btnSpinner" class="hidden animate-spin">⏳</span>
-                        <span>Run BrainVis Pipeline</span>
+                    <button id="runBtn" onclick="runPipeline()" class="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded text-xs transition">
+                        Run BrainVis Pipeline
                     </button>
                 </div>
             </div>
 
-            <!-- Waveform Preview Canvas -->
-            <div class="card p-5 md:col-span-2 flex flex-col justify-between">
+            <div class="card p-4 md:col-span-2 flex flex-col justify-between">
                 <div>
-                    <div class="flex justify-between items-center mb-2">
-                        <h2 class="text-lg font-bold text-white">📈 EEG Waveform Trace</h2>
-                        <span id="signalMeta" class="text-xs text-gray-400">128 Channels | 440 Samples | 250 Hz</span>
+                    <div class="flex justify-between items-center mb-1">
+                        <h2 class="text-sm font-bold text-white">📈 EEG Waveform (Channel 1 of 128)</h2>
+                        <span class="text-xs text-gray-400 font-mono">128 × 440 @ 250 Hz</span>
                     </div>
-                    <canvas id="waveformCanvas" width="700" height="150" class="w-full bg-gray-900 rounded border border-gray-800"></canvas>
+                    <canvas id="waveformCanvas" width="700" height="130" class="w-full bg-gray-900 rounded border border-gray-800"></canvas>
                 </div>
-                <div class="grid grid-cols-4 gap-2 mt-4 text-center">
-                    <div class="bg-gray-800 p-2 rounded">
-                        <span class="block text-xs text-gray-400">Mean Amplitude</span>
-                        <span id="statMean" class="font-mono text-sm text-blue-400">-</span>
+                <div class="grid grid-cols-3 gap-2 mt-2 text-center text-xs">
+                    <div class="bg-gray-800 p-1.5 rounded font-mono">
+                        <span class="text-gray-400 block text-xxs">CLIP Latent Norm</span>
+                        <span id="latentNorm" class="text-indigo-400 font-semibold">-</span>
                     </div>
-                    <div class="bg-gray-800 p-2 rounded">
-                        <span class="block text-xs text-gray-400">Peak-to-Peak</span>
-                        <span id="statPtp" class="font-mono text-sm text-green-400">-</span>
+                    <div class="bg-gray-800 p-1.5 rounded font-mono">
+                        <span class="text-gray-400 block text-xxs">Execution Target</span>
+                        <span id="execSource" class="text-blue-400 font-semibold">-</span>
                     </div>
-                    <div class="bg-gray-800 p-2 rounded">
-                        <span class="block text-xs text-gray-400">RMS Value</span>
-                        <span id="statRms" class="font-mono text-sm text-yellow-400">-</span>
-                    </div>
-                    <div class="bg-gray-800 p-2 rounded">
-                        <span class="block text-xs text-gray-400">Spectral Entropy</span>
-                        <span id="statEntropy" class="font-mono text-sm text-purple-400">-</span>
+                    <div class="bg-gray-800 p-1.5 rounded font-mono">
+                        <span class="text-gray-400 block text-xxs">Checkpoint Status</span>
+                        <span id="ckptBadge" class="text-yellow-400 font-semibold">-</span>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Results Grid -->
+        <!-- Predictions & Reconstructions -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <!-- Frequency Bands -->
-            <div class="card p-5">
-                <h3 class="text-md font-bold text-white mb-4">📊 EEG Frequency Bands</h3>
-                <div class="space-y-3" id="bandsContainer">
-                    <div>
-                        <div class="flex justify-between text-xs mb-1">
-                            <span>Delta (0.5 - 4 Hz)</span>
-                            <span id="bandDelta" class="font-mono text-gray-400">-</span>
-                        </div>
-                        <div class="progress-bar"><div id="barDelta" class="progress-fill bg-blue-500" style="width: 0%"></div></div>
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-xs mb-1">
-                            <span>Theta (4 - 8 Hz)</span>
-                            <span id="bandTheta" class="font-mono text-gray-400">-</span>
-                        </div>
-                        <div class="progress-bar"><div id="barTheta" class="progress-fill bg-green-500" style="width: 0%"></div></div>
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-xs mb-1">
-                            <span>Alpha (8 - 13 Hz)</span>
-                            <span id="bandAlpha" class="font-mono text-gray-400">-</span>
-                        </div>
-                        <div class="progress-bar"><div id="barAlpha" class="progress-fill bg-yellow-500" style="width: 0%"></div></div>
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-xs mb-1">
-                            <span>Beta (13 - 30 Hz)</span>
-                            <span id="bandBeta" class="font-mono text-gray-400">-</span>
-                        </div>
-                        <div class="progress-bar"><div id="barBeta" class="progress-fill bg-red-500" style="width: 0%"></div></div>
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-xs mb-1">
-                            <span>Gamma (30 - 50 Hz)</span>
-                            <span id="bandGamma" class="font-mono text-gray-400">-</span>
-                        </div>
-                        <div class="progress-bar"><div id="barGamma" class="progress-fill bg-purple-500" style="width: 0%"></div></div>
-                    </div>
+            <div class="card p-4">
+                <h3 class="text-xs font-bold uppercase text-gray-400 mb-2">Decoded Brain Stimulus</h3>
+                <div class="bg-gray-800 p-3 rounded mb-3 text-center">
+                    <span id="topLabel" class="text-lg font-extrabold text-indigo-400 capitalize block">Awaiting Signal</span>
+                    <span id="topMeta" class="text-xs text-gray-400 block">-</span>
                 </div>
-
-                <div class="mt-6 border-t border-gray-800 pt-4 text-xs space-y-1">
-                    <div class="flex justify-between">
-                        <span class="text-gray-400">Alpha / Theta Ratio:</span>
-                        <span id="idxAlphaTheta" class="font-mono text-white">-</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-400">Visual Attention Index:</span>
-                        <span id="idxVisualAttn" class="font-mono text-white">-</span>
-                    </div>
+                <h4 class="text-xxs uppercase tracking-wider text-gray-500 mb-2">Top-5 AlignNet Predictions</h4>
+                <div id="topList" class="space-y-1.5 text-xs">
+                    <div class="text-gray-500 italic">Run pipeline to inspect probabilities...</div>
                 </div>
             </div>
 
-            <!-- Decoded Stimulus & Top Predictions -->
-            <div class="card p-5">
-                <h3 class="text-md font-bold text-white mb-3">🎯 Decoded Visual Category</h3>
-                <div class="bg-gray-800 p-3 rounded mb-4 text-center">
-                    <span class="text-xs text-gray-400 uppercase tracking-wider block">Predicted Visual Stimulus</span>
-                    <span id="topLabel" class="text-xl font-extrabold text-indigo-400 capitalize block mt-1">Awaiting Signal</span>
-                    <span id="topMeta" class="text-xs text-gray-400 block mt-0.5">-</span>
+            <div class="card p-4 flex flex-col justify-between">
+                <div>
+                    <div class="flex justify-between items-center mb-2">
+                        <h3 class="text-xs font-bold uppercase text-gray-400">Reconstructed Visual Stimulus</h3>
+                        <span id="engineBadge" class="text-xxs bg-gray-800 px-1.5 py-0.5 rounded text-gray-400">-</span>
+                    </div>
+                    <div class="relative bg-gray-900 rounded border border-gray-800 aspect-square flex items-center justify-center overflow-hidden mb-2">
+                        <img id="reconImg" src="" alt="Reconstructed Stimulus" class="w-full h-full object-cover hidden">
+                        <span id="reconPlaceholder" class="text-xs text-gray-500">Image will appear upon execution</span>
+                    </div>
                 </div>
-
-                <h4 class="text-xs font-semibold text-gray-400 mb-2 uppercase">Top-5 Probabilities</h4>
-                <div id="topList" class="space-y-2 text-xs">
-                    <div class="text-gray-500 italic">Run pipeline to see probabilities...</div>
-                </div>
+                <div id="reconWarning" class="text-xxs text-gray-400 italic"></div>
             </div>
 
-            <!-- Reconstructed Image & Cortical Saliency -->
-            <div class="card p-5 flex flex-col justify-between">
+            <div class="card p-4 flex flex-col justify-between">
                 <div>
-                    <h3 class="text-md font-bold text-white mb-3">🖼️ Reconstructed Image</h3>
-                    <div class="relative bg-gray-900 rounded border border-gray-800 aspect-square flex items-center justify-center overflow-hidden mb-3">
-                        <img id="reconImage" src="" alt="Reconstructed Stimulus" class="w-full h-full object-cover hidden">
-                        <div id="reconPlaceholder" class="text-center p-4">
-                            <span class="text-3xl block mb-2">👁️</span>
-                            <span class="text-xs text-gray-500">Image will appear upon pipeline execution</span>
-                        </div>
+                    <h3 class="text-xs font-bold uppercase text-gray-400 mb-2">Cortical Saliency Heatmap</h3>
+                    <div class="bg-gray-900 rounded border border-gray-800 aspect-square flex items-center justify-center overflow-hidden mb-2">
+                        <img id="saliencyImg" src="" alt="Saliency Heatmap" class="w-full h-full object-cover hidden">
+                        <span id="saliencyPlaceholder" class="text-xs text-gray-500">Topographic projection</span>
                     </div>
                 </div>
-
-                <div>
-                    <h4 class="text-xs font-semibold text-gray-400 mb-1">Cortical Saliency Map</h4>
-                    <div class="h-16 bg-gray-900 rounded border border-gray-800 overflow-hidden flex items-center justify-center">
-                        <img id="saliencyImage" src="" alt="Saliency Map" class="w-full h-full object-cover hidden">
-                        <span id="saliencyPlaceholder" class="text-xs text-gray-500">Signal topography</span>
-                    </div>
-                </div>
+                <div class="text-xxs text-gray-500 font-mono text-center">128-Electrode Spatial Mapping</div>
             </div>
         </div>
     </div>
 
     <script>
-        // Draw synthetic EEG waveform trace on load
-        function drawDummyWave() {
-            const canvas = document.getElementById('waveformCanvas');
-            const ctx = canvas.getContext('2d');
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ctx.strokeStyle = '#58a6ff';
-            ctx.lineWidth = 1.5;
-            ctx.beginPath();
-            const width = canvas.width;
-            const height = canvas.height;
-            const mid = height / 2;
+        async function fetchStatus() {
+            try {
+                const res = await fetch('/api/model-status');
+                const data = await res.json();
+                const banner = document.getElementById('statusBanner');
+                const led = document.getElementById('statusLed');
+                const details = document.getElementById('statusDetails');
 
-            for (let x = 0; x < width; x++) {
-                const t = x / 40;
-                const y = mid + Math.sin(t * 1.5) * 25 + Math.sin(t * 3.7) * 15 + (Math.random() - 0.5) * 8;
-                if (x === 0) ctx.moveTo(x, y);
-                else ctx.lineTo(x, y);
-            }
-            ctx.stroke();
+                if (data.checkpoint.is_loaded) {
+                    banner.className = 'card p-3 mb-6 flex flex-col md:flex-row justify-between items-start md:items-center text-xs border-green-600 bg-green-900 bg-opacity-20';
+                    led.className = 'text-green-400 font-bold';
+                    led.innerText = '🟢 Checkpoint Active';
+                    details.innerText = 'Loaded ' + data.checkpoint.source;
+                } else {
+                    banner.className = 'card p-3 mb-6 flex flex-col md:flex-row justify-between items-start md:items-center text-xs border-yellow-600 bg-yellow-900 bg-opacity-20';
+                    led.className = 'text-yellow-400 font-bold';
+                    led.innerText = '⚠️ Checkpoint Missing (Untrained Baseline)';
+                    details.innerText = 'clipfinetune_model.pkl not mounted. Running baseline model.';
+                }
+            } catch (e) {}
         }
-        drawDummyWave();
+        fetchStatus();
 
-        async function runAnalysis() {
+        async function runPipeline() {
             const btn = document.getElementById('runBtn');
-            const spinner = document.getElementById('btnSpinner');
             btn.disabled = true;
-            spinner.classList.remove('hidden');
+            btn.innerText = 'Computing...';
 
             const fileInput = document.getElementById('eegFileInput');
             const presetSelect = document.getElementById('presetSelect');
@@ -451,84 +441,75 @@ def web_dashboard():
                 if (fileInput.files.length > 0) {
                     const formData = new FormData();
                     formData.append('file', fileInput.files[0]);
-                    const response = await fetch('/api/upload-eeg', { method: 'POST', body: formData });
-                    res = await response.json();
+                    const r = await fetch('/api/upload-eeg', { method: 'POST', body: formData });
+                    if (!r.ok) {
+                        const err = await r.json();
+                        throw new Error(err.detail || 'Contract validation failed');
+                    }
+                    res = await r.json();
                 } else {
-                    const preset = presetSelect.value;
-                    const response = await fetch('/api/pipeline', {
+                    const r = await fetch('/api/pipeline', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ preset: preset, top_k: 5 })
+                        body: JSON.stringify({ preset: presetSelect.value, top_k: 5 })
                     });
-                    res = await response.json();
+                    if (!r.ok) {
+                        const err = await r.json();
+                        throw new Error(err.detail || 'Pipeline error');
+                    }
+                    res = await r.json();
                 }
 
-                updateDashboard(res);
+                updateUI(res);
             } catch (err) {
-                alert("Error running BrainVis pipeline: " + err.message);
+                alert("Error: " + err.message);
             } finally {
                 btn.disabled = false;
-                spinner.classList.add('hidden');
+                btn.innerText = 'Run BrainVis Pipeline';
             }
         }
 
-        function updateDashboard(data) {
+        function updateUI(data) {
             const analysis = data.analysis || {};
-            const stats = analysis.statistics || {};
-            const spectral = analysis.spectral_analysis || {};
-            const relPowers = spectral.relative_powers_percent || {};
-            const indices = spectral.indices || {};
             const stimulus = analysis.predicted_stimulus || {};
             const topList = analysis.top_predictions || [];
             const recon = data.reconstruction || {};
 
-            // Waveform stats
-            document.getElementById('statMean').innerText = stats.mean_amplitude_uv ?? '-';
-            document.getElementById('statPtp').innerText = stats.peak_to_peak_uv ?? '-';
-            document.getElementById('statRms').innerText = stats.rms_uv ?? '-';
-            document.getElementById('statEntropy').innerText = stats.spectral_entropy ?? '-';
+            document.getElementById('latentNorm').innerText = analysis.clip_latent_norm || '-';
+            document.getElementById('execSource').innerText = data.source || 'gateway';
+            document.getElementById('ckptBadge').innerText = analysis.is_checkpoint_loaded ? 'Trained' : 'Baseline';
+            document.getElementById('ckptBadge').className = analysis.is_checkpoint_loaded ? 'text-green-400 font-semibold' : 'text-yellow-400 font-semibold';
 
-            // Bands
-            const bands = ['Delta', 'Theta', 'Alpha', 'Beta', 'Gamma'];
-            bands.forEach(b => {
-                const val = relPowers[b.toLowerCase()] || 0;
-                document.getElementById('band' + b).innerText = val + '%';
-                document.getElementById('bar' + b).style.width = Math.min(100, val * 2.5) + '%';
-            });
-
-            document.getElementById('idxAlphaTheta').innerText = indices.alpha_theta_ratio ?? '-';
-            document.getElementById('idxVisualAttn').innerText = indices.visual_attention_index ?? '-';
-
-            // Top Stimulus
             document.getElementById('topLabel').innerText = stimulus.label || 'Unknown';
             document.getElementById('topMeta').innerText = (stimulus.category || '') + ' • Confidence: ' + (stimulus.confidence_percent || 0) + '%';
 
-            // Top-5 List
-            const listContainer = document.getElementById('topList');
-            listContainer.innerHTML = '';
+            const list = document.getElementById('topList');
+            list.innerHTML = '';
             topList.forEach(item => {
                 const row = document.createElement('div');
                 row.className = 'flex justify-between items-center bg-gray-800 p-1.5 rounded';
-                row.innerHTML = `
-                    <span class="capitalize text-gray-300 font-medium">${item.label}</span>
-                    <span class="font-mono text-indigo-400 font-semibold">${item.confidence_percent}%</span>
-                `;
-                listContainer.appendChild(row);
+                row.innerHTML = `<span class="capitalize text-gray-300">${item.label}</span><span class="font-mono text-indigo-400 font-bold">${item.confidence_percent}%</span>`;
+                list.appendChild(row);
             });
 
-            // Images
+            document.getElementById('engineBadge').innerText = recon.engine || '-';
+
             if (recon.reconstructed_image_base64) {
-                const img = document.getElementById('reconImage');
+                const img = document.getElementById('reconImg');
                 img.src = recon.reconstructed_image_base64;
                 img.classList.remove('hidden');
                 document.getElementById('reconPlaceholder').classList.add('hidden');
             }
 
             if (recon.saliency_map_base64) {
-                const salImg = document.getElementById('saliencyImage');
-                salImg.src = recon.saliency_map_base64;
-                salImg.classList.remove('hidden');
+                const sal = document.getElementById('saliencyImg');
+                sal.src = recon.saliency_map_base64;
+                sal.classList.remove('hidden');
                 document.getElementById('saliencyPlaceholder').classList.add('hidden');
+            }
+
+            if (recon.note) {
+                document.getElementById('reconWarning').innerText = recon.note;
             }
         }
     </script>
