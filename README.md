@@ -2,6 +2,18 @@
 
 ![Framework](/figures/framework.jpg)
 
+> [!NOTE]
+> **🚀 Fast Cloud Deployment on Render (Lightweight REST Endpoint & Dashboard)**:
+> You can deploy BrainVis directly to **Render** without downloading heavy CUDA dependencies or 4.2GB model weights! See the complete guide: [DEPLOYMENT_RENDER.md](DEPLOYMENT_RENDER.md).
+>
+> **Endpoints provided**:
+> - `/` - Interactive Web Dashboard & EEG Waveform Visualizer
+> - `/api/pipeline` - End-to-end EEG wave analysis and image reconstruction
+> - `/api/analyze` - EEG frequency bands (Delta, Theta, Alpha, Beta, Gamma) & signal statistics
+> - `/api/reconstruct` - Visual stimulus image reconstruction
+> - `/api/upload-eeg` - Direct `.npy`, `.csv`, `.json`, `.pth` upload
+> - `/health` & `/docs` - Health monitoring and OpenAPI Swagger documentation
+
 Abstract: *Analyzing and reconstructing visual stimuli from brain signals effectively advances our understanding of the human visual system. However, EEG signals are complex and contain significant noise, leading to substantial limitations in existing approaches of visual stimuli reconstruction from EEG. These limitations include difficulties in aligning EEG embeddings with fine-grained semantic information and a heavy reliance on additional large-scale datasets for training. To address these challenges, we propose a novel approach called BrainVis. This approach introduces a self-supervised paradigm to learn EEG time-domain features and incorporates frequency-domain features to enhance EEG representations. We also propose a multi-modal alignment method called semantic interpolation to achieve fine-grained semantic reconstruction. Additionally, we employ cascaded diffusion models to reconstruct images. Using only 9.1\% of the training data required by previous mask modeling works, our proposed BrainVis outperforms state-of-the-art methods in both semantic fidelity reconstruction and generation quality.*
 
 ![Results](/figures/results.jpg)
